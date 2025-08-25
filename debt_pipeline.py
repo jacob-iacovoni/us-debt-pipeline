@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import sqlite3
 from typing import Optional, Dict, Any, List
@@ -11,14 +10,11 @@ import pandas as pd
 
 class FREDDataPipeline:
     """
-    Pipeline for automatically pulling US debt-to-GDP data from FRED API.
-    Produces a CSV with:
-      - ASTDSL (short-term debt, $B)
-      - ASTLL (long-term debt, $B)
-      - GDP ($B)
-      - ASTDSL_GDP_PCT (short-term debt % of GDP)
-      - ASTLL_GDP_PCT (long-term debt % of GDP)
-      - COMBINED_DEBT_GDP_PCT (sum of the two)
+    Pulls debt & GDP data from FRED, stores to SQLite, computes ratios, and exports CSV.
+
+    Output CSV columns (where available):
+      Levels (billions): ASTDSL, ASTLL, TCMDO, GDP
+      Ratios  (% GDP) : ASTDSL_GDP_PCT, ASTLL_GDP_PCT, COMBINED_DEBT_GDP_PCT, TCMDO_GDP_PCT, PRIVATE_DEBT_GDP_PCT
     """
 
     def __init__(self, api_key: str, db_path: str = "economic_data.db"):
@@ -28,12 +24,18 @@ class FREDDataPipeline:
         self.setup_logging()
         self.setup_database()
 
-        # FRED series IDs
+        # FRED series:
+        # - ASTDSL: All Sectors; Debt Securities; Liability, Level (millions)
+        # - ASTLL : All Sectors; Loans; Liability, Level (millions)
+        # - TCMDO : All Sectors; Debt Securities and Loans; Liability, Level (millions)
+        # - GDP   : Gross Domestic Product (billions, SAAR)
+        # - QUSPAM770A: Private Non-Financial Sector Credit, % of GDP (already percent)
         self.series_ids = {
-            "short_term_debt": "ASTDSL",      # Federal Government; Short-Term Debt Securities ($B)
-            "long_term_debt": "ASTLL",        # Federal Government; Long-Term Debt Securities ($B)
-            "gdp": "GDP",                     # Gross Domestic Product ($B, SAAR quarterly)
-            "total_debt_gdp": "GFDEGDQ188S",  # Total Public Debt as % of GDP (reference)
+            "debt_securities_all": "ASTDSL",
+            "loans_all": "ASTLL",
+            "all_sectors_debt": "TCMDO",
+            "gdp": "GDP",
+            "private_debt_gdp_pct": "QUSPAM770A",
         }
 
     # ----------------------------
@@ -75,6 +77,14 @@ class FREDDataPipeline:
     # ----------------------------
     # FRED helpers
     # ----------------------------
+    def _scale_to_billions(self, series_id: str, df: pd.DataFrame) -> pd.DataFrame:
+        """Scale Z.1 'level' series (in millions) to billions to match GDP units."""
+        in_millions = {"ASTDSL", "ASTLL", "TCMDO"}
+        if series_id in in_millions and not df.empty:
+            df = df.copy()
+            df["value"] = df["value"] / 1000.0  # millions -> billions
+        return df
+
     def get_fred_data(
         self,
         series_id: str,
@@ -105,26 +115,22 @@ class FREDDataPipeline:
             df["date"] = pd.to_datetime(df["date"])
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
             df = df.dropna(subset=["value"])
+            df = df[["date", "value"]]
+            df = self._scale_to_billions(series_id, df)  # normalize units
             self.logger.info(f"Fetched {len(df)} observations for {series_id}")
-            return df[["date", "value"]]
+            return df
         except Exception as e:
             self.logger.error(f"API request failed for {series_id}: {e}")
             return None
 
     def get_series_info(self, series_id: str) -> Dict[str, Any]:
-        """Get metadata about a FRED series."""
-        params = {
-            "series_id": series_id,
-            "api_key": self.api_key,
-            "file_type": "json",
-        }
+        params = {"series_id": series_id, "api_key": self.api_key, "file_type": "json"}
         try:
             url = f"{self.base_url}/series"
             resp = requests.get(url, params=params, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-            series_info = data.get("seriess", [{}])[0]
-            return series_info
+            return data.get("seriess", [{}])[0]
         except Exception as e:
             self.logger.error(f"Error getting series info for {series_id}: {e}")
             return {}
@@ -186,67 +192,86 @@ class FREDDataPipeline:
     # Calculations & Export
     # ----------------------------
     def calculate_debt_gdp_ratios(self) -> pd.DataFrame:
+        """
+        Build panel with:
+          Levels (billions): ASTDSL_B, ASTLL_B, TCMDO_B, GDP_B
+          Ratios  (% GDP) : ASTDSL_GDP_PCT, ASTLL_GDP_PCT, COMBINED_DEBT_GDP_PCT, TCMDO_GDP_PCT, PRIVATE_DEBT_GDP_PCT
+        """
         try:
-            short_df = self.get_latest_data("ASTDSL")
-            long_df = self.get_latest_data("ASTLL")
-            gdp_df = self.get_latest_data("GDP")
+            ast_dsec = self.get_latest_data("ASTDSL")      # billions (scaled)
+            ast_loans = self.get_latest_data("ASTLL")      # billions (scaled)
+            tcmdo     = self.get_latest_data("TCMDO")      # billions (scaled)
+            gdp       = self.get_latest_data("GDP")        # billions
+            priv_pct  = self.get_latest_data("QUSPAM770A") # percent
 
-            if short_df.empty or long_df.empty or gdp_df.empty:
-                self.logger.error("Missing data for ratio calculations")
+            if any(df.empty for df in [ast_dsec, ast_loans, gdp]):
+                self.logger.error("Missing core series for ratio calculations (ASTDSL/ASTLL/GDP).")
                 return pd.DataFrame()
 
-            short_df = short_df[["date", "value"]].rename(columns={"value": "short_term_debt"})
-            long_df = long_df[["date", "value"]].rename(columns={"value": "long_term_debt"})
-            gdp_df = gdp_df[["date", "value"]].rename(columns={"value": "gdp"})
+            dsec  = ast_dsec[["date", "value"]].rename(columns={"value": "ASTDSL_B"})
+            loans = ast_loans[["date", "value"]].rename(columns={"value": "ASTLL_B"})
+            gdpdf = gdp[["date", "value"]].rename(columns={"value": "GDP_B"})
 
-            merged = short_df.merge(long_df, on="date", how="inner").merge(gdp_df, on="date", how="inner")
+            merged = dsec.merge(loans, on="date", how="inner").merge(gdpdf, on="date", how="inner")
 
-            merged["short_term_debt_gdp_pct"] = (merged["short_term_debt"] / merged["gdp"]) * 100.0
-            merged["long_term_debt_gdp_pct"] = (merged["long_term_debt"] / merged["gdp"]) * 100.0
-            merged["total_debt_gdp_pct"] = merged["short_term_debt_gdp_pct"] + merged["long_term_debt_gdp_pct"]
+            if not tcmdo.empty:
+                merged = merged.merge(
+                    tcmdo[["date", "value"]].rename(columns={"value": "TCMDO_B"}), on="date", how="left"
+                )
+
+            if not priv_pct.empty:
+                merged = merged.merge(
+                    priv_pct[["date", "value"]].rename(columns={"value": "PRIVATE_DEBT_GDP_PCT"}),
+                    on="date",
+                    how="left",
+                )
+
+            # Ratios
+            merged["ASTDSL_GDP_PCT"] = (merged["ASTDSL_B"] / merged["GDP_B"]) * 100.0
+            merged["ASTLL_GDP_PCT"]  = (merged["ASTLL_B"]  / merged["GDP_B"]) * 100.0
+            merged["COMBINED_DEBT_GDP_PCT"] = merged["ASTDSL_GDP_PCT"] + merged["ASTLL_GDP_PCT"]
+            if "TCMDO_B" in merged.columns:
+                merged["TCMDO_GDP_PCT"] = (merged["TCMDO_B"] / merged["GDP_B"]) * 100.0
 
             merged = merged.sort_values("date").reset_index(drop=True)
-            self.logger.info(f"Calculated ratios for {len(merged)} dates")
+            self.logger.info(f"Calculated ratios for {len(merged)} quarters.")
             return merged
         except Exception as e:
-            self.logger.error(f"Error calculating ratios: {e}")
+            self.logger.error(f"Error calculating debt/GDP ratios: {e}")
             return pd.DataFrame()
 
-    def store_calculated_ratios(self, ratios_df: pd.DataFrame) -> None:
+    def store_calculated_ratios(self, ratios_df: pd.DataFrame):
         if ratios_df.empty:
             return
         try:
             with sqlite3.connect(self.db_path) as conn:
                 mapping = {
-                    "ASTDSL_GDP_PCT": "short_term_debt_gdp_pct",
-                    "ASTLL_GDP_PCT": "long_term_debt_gdp_pct",
-                    "COMBINED_DEBT_GDP_PCT": "total_debt_gdp_pct",
+                    "ASTDSL_GDP_PCT": "ASTDSL_GDP_PCT",
+                    "ASTLL_GDP_PCT": "ASTLL_GDP_PCT",
+                    "COMBINED_DEBT_GDP_PCT": "COMBINED_DEBT_GDP_PCT",
+                    "TCMDO_GDP_PCT": "TCMDO_GDP_PCT",
+                    "PRIVATE_DEBT_GDP_PCT": "PRIVATE_DEBT_GDP_PCT",
                 }
                 for series_id, col in mapping.items():
+                    if col not in ratios_df.columns:
+                        continue
                     conn.execute("DELETE FROM economic_data WHERE series_id = ?", (series_id,))
                     rows = [
-                        (
-                            series_id,
-                            row["date"].strftime("%Y-%m-%d"),
-                            float(row[col]),
-                            datetime.now().isoformat(),
-                        )
+                        (series_id, row["date"].strftime("%Y-%m-%d"), float(row[col]), datetime.now().isoformat())
                         for _, row in ratios_df.iterrows()
+                        if pd.notna(row.get(col))
                     ]
                     conn.executemany(
-                        """
-                        INSERT INTO economic_data (series_id, date, value, last_updated)
-                        VALUES (?, ?, ?, ?)
-                        """,
+                        "INSERT INTO economic_data (series_id, date, value, last_updated) VALUES (?, ?, ?, ?)",
                         rows,
                     )
-            self.logger.info("Stored calculated ratios.")
+            self.logger.info("Stored calculated ratio series.")
         except Exception as e:
             self.logger.error(f"Error storing calculated ratios: {e}")
             raise
 
     def export_to_csv(self, output_path: str, include_ratios: bool = True) -> bool:
-        """Export raw series and (optionally) ratio columns to CSV."""
+        """Export raw series and (optionally) computed ratio columns to CSV."""
         try:
             df = self.get_latest_data()
             if df.empty:
@@ -255,12 +280,18 @@ class FREDDataPipeline:
 
             pivot = df.pivot(index="date", columns="series_id", values="value")
 
-            if include_ratios:
-                have_cols = all(c in pivot.columns for c in ["ASTDSL_GDP_PCT", "ASTLL_GDP_PCT", "COMBINED_DEBT_GDP_PCT"])
-                if not have_cols and all(c in pivot.columns for c in ["ASTDSL", "ASTLL", "GDP"]):
+            # Compute ratios on the fly if not persisted
+            have_base = all(c in pivot.columns for c in ["ASTDSL", "ASTLL", "GDP"])
+            if include_ratios and have_base:
+                if "ASTDSL_GDP_PCT" not in pivot.columns:
                     pivot["ASTDSL_GDP_PCT"] = (pivot["ASTDSL"] / pivot["GDP"]) * 100.0
+                if "ASTLL_GDP_PCT" not in pivot.columns:
                     pivot["ASTLL_GDP_PCT"] = (pivot["ASTLL"] / pivot["GDP"]) * 100.0
+                if "COMBINED_DEBT_GDP_PCT" not in pivot.columns:
                     pivot["COMBINED_DEBT_GDP_PCT"] = pivot["ASTDSL_GDP_PCT"] + pivot["ASTLL_GDP_PCT"]
+                if "TCMDO" in pivot.columns and "TCMDO_GDP_PCT" not in pivot.columns:
+                    pivot["TCMDO_GDP_PCT"] = (pivot["TCMDO"] / pivot["GDP"]) * 100.0
+                # PRIVATE_DEBT_GDP_PCT is already a percent if present
 
             pivot = pivot.sort_index()
             pivot.to_csv(output_path)
@@ -293,7 +324,7 @@ class FREDDataPipeline:
         except Exception as e:
             self.logger.error(f"Error logging pipeline run: {e}")
 
-    def run_pipeline(self, lookback_years: int = 20) -> Dict[str, bool]:
+    def run_pipeline(self, lookback_years: int = 30) -> Dict[str, bool]:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         start_date = (datetime.now() - timedelta(days=365 * lookback_years)).strftime("%Y-%m-%d")
 
@@ -302,6 +333,7 @@ class FREDDataPipeline:
 
         self.logger.info(f"Starting run {run_id}; fetching from {start_date} to present")
 
+        # Fetch & store for each series id
         for name, sid in self.series_ids.items():
             try:
                 info = self.get_series_info(sid)
@@ -315,7 +347,10 @@ class FREDDataPipeline:
 
                     latest_date = df["date"].max()
                     latest_val = float(df.loc[df["date"] == latest_date, "value"].iloc[0])
-                    pretty = f"${latest_val:.1f}B" if sid in ("GDP", "ASTDSL", "ASTLL") else f"{latest_val:.2f}%"
+                    if sid in ("ASTDSL", "ASTLL", "TCMDO", "GDP"):
+                        pretty = f"${latest_val:.1f}B"
+                    else:
+                        pretty = f"{latest_val:.2f}%"
                     self.logger.info(f"Latest {sid} = {pretty} (as of {latest_date.date()})")
                 else:
                     results[sid] = False
@@ -335,10 +370,10 @@ class FREDDataPipeline:
                 self.store_calculated_ratios(ratios)
                 latest = ratios.iloc[-1]
                 self.logger.info(
-                    "Latest ratios — Short: %.2f%%, Long: %.2f%%, Combined: %.2f%%",
-                    latest["short_term_debt_gdp_pct"],
-                    latest["long_term_debt_gdp_pct"],
-                    latest["total_debt_gdp_pct"],
+                    "Latest ratios — Securities: %.2f%%, Loans: %.2f%%, Combined: %.2f%%",
+                    latest["ASTDSL_GDP_PCT"],
+                    latest["ASTLL_GDP_PCT"],
+                    latest["COMBINED_DEBT_GDP_PCT"],
                 )
         else:
             self.logger.warning("Missing required series; skipping ratio calculation")
@@ -354,27 +389,19 @@ class FREDDataPipeline:
             latest = ratios.iloc[-1]
             summary = {
                 "latest_date": latest["date"].strftime("%Y-%m-%d"),
-                "short_term_debt_gdp": round(latest["short_term_debt_gdp_pct"], 2),
-                "long_term_debt_gdp": round(latest["long_term_debt_gdp_pct"], 2),
-                "combined_debt_gdp": round(latest["total_debt_gdp_pct"], 2),
-                "short_term_debt_billions": round(latest["short_term_debt"], 1),
-                "long_term_debt_billions": round(latest["long_term_debt"], 1),
-                "gdp_billions": round(latest["gdp"], 1),
+                "short_term_debt_gdp": round(latest["ASTDSL_GDP_PCT"], 2),
+                "long_term_debt_gdp": round(latest["ASTLL_GDP_PCT"], 2),
+                "combined_debt_gdp": round(latest["COMBINED_DEBT_GDP_PCT"], 2),
+                "gdp_billions": round(latest["GDP_B"], 1),
+                "ASTDSL_billions": round(latest["ASTDSL_B"], 1),
+                "ASTLL_billions": round(latest["ASTLL_B"], 1),
             }
-
-            one_year_ago = latest["date"] - pd.DateOffset(years=1)
-            past = ratios[ratios["date"] <= one_year_ago]
-            if not past.empty:
-                hist = past.iloc[-1]
-                summary["yoy_change_short_term"] = round(
-                    latest["short_term_debt_gdp_pct"] - hist["short_term_debt_gdp_pct"], 2
-                )
-                summary["yoy_change_long_term"] = round(
-                    latest["long_term_debt_gdp_pct"] - hist["long_term_debt_gdp_pct"], 2
-                )
-                summary["yoy_change_combined"] = round(
-                    latest["total_debt_gdp_pct"] - hist["total_debt_gdp_pct"], 2
-                )
+            if "TCMDO_B" in latest:
+                summary["TCMDO_billions"] = round(latest["TCMDO_B"], 1)
+                if "TCMDO_GDP_PCT" in latest:
+                    summary["TCMDO_debt_gdp"] = round(latest["TCMDO_GDP_PCT"], 2)
+            if "PRIVATE_DEBT_GDP_PCT" in latest and pd.notna(latest["PRIVATE_DEBT_GDP_PCT"]):
+                summary["private_debt_gdp"] = round(latest["PRIVATE_DEBT_GDP_PCT"], 2)
             return summary
         except Exception as e:
             self.logger.error(f"Error building summary: {e}")
@@ -382,7 +409,7 @@ class FREDDataPipeline:
 
 
 def main():
-    # Read the key from env (works with GitHub Actions)
+    # Read API key from env (works with GitHub Actions secrets)
     API_KEY = os.getenv("FRED_API_KEY", "").strip()
     if not API_KEY:
         print("Please set FRED_API_KEY in your environment.")
@@ -394,14 +421,18 @@ def main():
     print("Starting debt-to-GDP data pipeline…")
     pipeline.run_pipeline(lookback_years=30)
 
-    # Show a small summary in logs/stdout
+    # Show a small summary
     summary = pipeline.get_debt_analysis_summary()
     if summary:
         print(f"As of {summary['latest_date']}:")
-        print(f"  Short-term Debt: ${summary['short_term_debt_billions']}B ({summary['short_term_debt_gdp']}% of GDP)")
-        print(f"  Long-term Debt:  ${summary['long_term_debt_billions']}B ({summary['long_term_debt_gdp']}% of GDP)")
-        print(f"  Combined Debt:   {summary['combined_debt_gdp']}% of GDP")
-        print(f"  GDP:             ${summary['gdp_billions']}B")
+        print(f"  Securities (ASTDSL): ${summary['ASTDSL_billions']}B ({summary['short_term_debt_gdp']}% of GDP)")
+        print(f"  Loans (ASTLL):       ${summary['ASTLL_billions']}B ({summary['long_term_debt_gdp']}% of GDP)")
+        print(f"  Combined (S+L):      {summary['combined_debt_gdp']}% of GDP")
+        print(f"  GDP:                 ${summary['gdp_billions']}B")
+        if "TCMDO_debt_gdp" in summary:
+            print(f"  TCMDO:               {summary['TCMDO_debt_gdp']}% of GDP")
+        if "private_debt_gdp" in summary:
+            print(f"  Private debt (BIS):  {summary['private_debt_gdp']}% of GDP")
 
     # Export data + ratios
     pipeline.export_to_csv("us_debt_components_analysis.csv", include_ratios=True)
