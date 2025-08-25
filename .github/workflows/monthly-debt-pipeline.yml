@@ -1,0 +1,59 @@
+name: Monthly US Debt Pipeline
+
+on:
+  schedule:
+    # Runs at 2 PM UTC on the 2nd of every month (avoids weekend issues)
+    - cron: '0 14 2 * *'
+  workflow_dispatch: # Allows manual triggering from GitHub UI
+
+jobs:
+  run-debt-pipeline:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests pandas
+    
+    - name: Update API key in pipeline script
+      run: |
+        sed -i 's/YOUR_FRED_API_KEY_HERE/${{ secrets.FRED_API_KEY }}/g' debt_pipeline.py
+    
+    - name: Run debt pipeline
+      run: |
+        python debt_pipeline.py
+    
+    - name: Upload results as artifacts
+      uses: actions/upload-artifact@v3
+      if: always() # Upload even if pipeline partially fails
+      with:
+        name: debt-pipeline-results-${{ github.run_number }}
+        path: |
+          us_debt_components_analysis.csv
+          economic_data.db
+          debt_pipeline.log
+        retention-days: 90 # Keep results for 90 days
+
+    - name: Create release with data (optional)
+      if: success()
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: data-${{ github.run_number }}
+        name: Debt Data - ${{ github.run_number }}
+        files: |
+          us_debt_components_analysis.csv
+          debt_pipeline.log
+        body: |
+          Automated debt pipeline run completed successfully.
+          
+          Run date: ${{ github.run_time }}
+          Run number: ${{ github.run_number }}
