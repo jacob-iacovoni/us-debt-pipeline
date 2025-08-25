@@ -14,10 +14,10 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
     
-    - name: Set up Python 3.9
-      uses: actions/setup-python@v4
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.9'
+        python-version: '3.11'
     
     - name: Install Python dependencies
       run: |
@@ -33,7 +33,7 @@ jobs:
         python debt_pipeline.py
     
     - name: Upload results as artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always() # Upload even if pipeline partially fails
       with:
         name: debt-pipeline-results-${{ github.run_number }}
@@ -45,7 +45,7 @@ jobs:
 
     - name: Create release with data (optional)
       if: success()
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         tag_name: data-${{ github.run_number }}
         name: Debt Data - ${{ github.run_number }}
